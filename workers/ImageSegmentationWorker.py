@@ -1,4 +1,5 @@
-from workers import BaseWorker
+#from workers import BaseWorker
+from TypeEnums import BaseWorker
 from TypeEnums import *
 import asyncio
 
@@ -10,7 +11,7 @@ class ImageSegmentationWorker(BaseWorker):
         super(ImageSegmentationWorker, self).__init__("worker1","image_segmentation")
         self.supported_methods={
             "lang_sam":self._execute_lang_sam,
-            "dino":self._execute_dino
+            "dino":self._execute_dino,
         }
         self.min_quality_threshold=0.7
         self.max_retry_attempts=3

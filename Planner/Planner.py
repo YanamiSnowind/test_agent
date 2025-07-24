@@ -1,6 +1,6 @@
 from TypeEnums import TaskStatus,Task,WorkerResult
 from llm import QwenLLMClient
-from workers import ImageSegmentationWorker, PointCloudMappingWorker, RigidMotionWorker, VisualizationWorker
+from workers import ImageSegmentationWorker, PointCloudMappingWorker, RigidMotionWorker
 from typing import Dict,List,Any,Optional
 import logging
 logging.basicConfig(level=logging.INFO,format='%(asctime)s-%(levelname)s-%(message)s')
@@ -8,6 +8,7 @@ logger=logging.getLogger(__name__)
 import json
 from TypeEnums import *
 import asyncio
+from Planner.planner_utils.motionControl import *
 
 class Planner:
     def __init__(self, llm_client: QwenLLMClient):
@@ -16,11 +17,93 @@ class Planner:
             "image_segmentation": ImageSegmentationWorker(),
             "pointcloud_mapping": PointCloudMappingWorker(),
             "rigid_motion": RigidMotionWorker(),
-            "visualization": VisualizationWorker()
+            # "visualization": VisualizationWorker()
         }
         self.task_history = []
         self.knowledge_base = self._init_knowledge_base()
 
+    async def analyze_instruction_with_thought_chain(self, instruction: str) -> List[ThoughtChain]:
+        """使用思维链分析用户指令"""
+        system_prompt = """
+        你是一个多模态点云控制系统的分析专家。请使用思维链方法深度分析用户指令。
+
+        分析维度：
+        1. 指令理解：理解用户想要实现什么
+        2. 技术路径：确定需要哪些技术步骤
+        3. 资源需求：分析需要什么资源和能力
+        4. 执行策略：规划如何执行
+        5. 潜在风险：识别可能的问题
+
+        返回JSON格式的思维链，每一步包含思考过程、推理逻辑、决策和置信度。
+        """
+
+        prompt = f"""
+        用户指令: "{instruction}"
+
+        请进行深度分析，返回JSON格式：
+        {{
+            "thought_chain": [
+                {{
+                    "step": 1,
+                    "thought": "指令理解",
+                    "reasoning": "详细的推理过程",
+                    "decision": "做出的决策",
+                    "confidence": 0.85
+                }},
+                {{
+                    "step": 2,
+                    "thought": "技术路径分析",
+                    "reasoning": "技术实现的推理",
+                    "decision": "选择的技术路径",
+                    "confidence": 0.90
+                }},
+                {{
+                    "step": 3,
+                    "thought": "资源和能力评估",
+                    "reasoning": "资源需求分析",
+                    "decision": "资源分配策略",
+                    "confidence": 0.80
+                }},
+                {{
+                    "step": 4,
+                    "thought": "执行策略制定",
+                    "reasoning": "执行方案推理",
+                    "decision": "具体执行策略",
+                    "confidence": 0.88
+                }},
+                {{
+                    "step": 5,
+                    "thought": "风险识别",
+                    "reasoning": "潜在问题分析",
+                    "decision": "风险应对措施",
+                    "confidence": 0.75
+                }}
+            ]
+        }}
+        """
+
+        try:
+            response = await self.llm_client.call_llm(prompt, system_prompt)
+            logger.info(f"思维链分析结果: {response}")
+
+            parsed_response = json.loads(response)
+            thought_chains = []
+
+            for chain_data in parsed_response.get("thought_chain", []):
+                thought_chain = ThoughtChain(
+                    step=chain_data["step"],
+                    thought=chain_data["thought"],
+                    reasoning=chain_data["reasoning"],
+                    decision=chain_data["decision"],
+                    confidence=chain_data["confidence"]
+                )
+                thought_chains.append(thought_chain)
+
+            return thought_chains
+
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"解析思维链分析结果失败: {e}")
+            return self._get_fallback_thought_chain(instruction)
     def _init_knowledge_base(self) -> Dict[str, Any]:
         """初始化领域知识库"""
         return {
@@ -93,41 +176,42 @@ class Planner:
     def _get_fallback_thought_chain(self, instruction: str) -> List[ThoughtChain]:
         """获取备用思维链"""
         return [
-            ThoughtChain(1, "解析用户指令", f"分析指令: {instruction}", "需要完整的多模态处理流程", 0.8),
-            ThoughtChain(2, "规划技术路径", "需要图像分割->点云映射->运动控制->可视化", "按顺序执行四个步骤", 0.9),
-            ThoughtChain(3, "制定执行策略", "采用串行执行，每步依赖前一步结果", "顺序执行所有worker", 0.85),
-            ThoughtChain(4, "评估风险", "可能存在分割不准确、映射错误等问题", "需要迭代优化机制", 0.7)
+            ThoughtChain(1, "指令理解", f"分析指令: {instruction}", "需要完整的多模态处理流程", 0.8),
+            ThoughtChain(2, "技术路径分析", "需要图像分割->点云映射->运动控制->可视化", "按顺序执行四个核心步骤", 0.9),
+            ThoughtChain(3, "资源评估", "需要图像处理、3D建模、动画生成能力", "使用现有worker资源", 0.85),
+            ThoughtChain(4, "执行策略", "采用串行执行，每步依赖前一步结果", "顺序执行所有worker", 0.88),
+            ThoughtChain(5, "风险识别", "可能存在分割不准确、映射错误等问题", "需要适当的容错机制", 0.75)
         ]
-
+    #planner核心任务，调用llm解析指令生成制定好的方案
     async def plan_tasks_with_reasoning(self, instruction: str) -> TaskPlan:
-        """基于思维链进行详细任务规划"""
+        """基于思维链进行详细任务规划 - 主入口方法"""
+        logger.info(f"开始规划任务，用户指令: {instruction}")
+
         # 1. 先进行思维链分析
         thought_chain = await self.analyze_instruction_with_thought_chain(instruction)
+        logger.info(f"思维链分析完成，共{len(thought_chain)}个步骤")
 
         # 2. 基于思维链结果进行精细化任务规划
         detailed_plan = await self._create_detailed_task_plan(instruction, thought_chain)
+        logger.info(f"任务规划完成，共{len(detailed_plan.tasks)}个任务")
 
         return detailed_plan
 
     async def _create_detailed_task_plan(self, instruction: str, thought_chain: List[ThoughtChain]) -> TaskPlan:
         """创建详细的任务规划"""
-        # 智能解析指令内容
+        logger.info("开始创建详细任务规划")
+
+        # 1. 智能解析指令内容
         parsed_info = await self._parse_instruction_semantics(instruction)
+        logger.info(f"指令语义解析完成: {parsed_info}")
 
-        # 根据解析结果选择合适的策略
+        # 2. 根据解析结果和思维链生成适应性任务
         tasks = await self._generate_adaptive_tasks(instruction, parsed_info, thought_chain)
-
-        # 制定执行策略
-        execution_strategy = self._create_execution_strategy(parsed_info, thought_chain)
-
-        # 风险评估
-        risk_assessment = self._assess_risks(parsed_info, thought_chain)
+        logger.info(f"生成了{len(tasks)}个自适应任务")
 
         return TaskPlan(
             tasks=tasks,
-            thought_chain=thought_chain,
-            execution_strategy=execution_strategy,
-            risk_assessment=risk_assessment
+            thought_chain=thought_chain
         )
 
     async def _parse_instruction_semantics(self, instruction: str) -> Dict[str, Any]:
@@ -278,262 +362,24 @@ class Planner:
 
         return tasks
 
-    def _choose_segmentation_strategy(self, parsed_info: Dict) -> str:
+    def _choose_segmentation_strategy(self, parsed_info: Dict[str, Any]) -> str:
         """选择分割策略"""
+        subject = parsed_info.get("subject", "")
         target_parts = parsed_info.get("target_parts", [])
-        precision_req = parsed_info.get("technical_requirements", {}).get("segmentation_precision", "medium")
 
-        # 小部件或高精度需求使用Lang-SAM
-        small_parts = ["手", "爪子", "眼睛", "耳朵"]
-        if any(part in target_parts for part in small_parts) or precision_req == "high":
-            return "lang_sam"
-        else:
-            return "dino"
+        # 基于主体大小选择策略
+        if subject in self.knowledge_base["animals"]:
+            size = self.knowledge_base["animals"][subject]["size"]
+            if size == "small":
+                return "lang_sam"  # 小物体用精确分割
+            elif size == "large":
+                return "dino"  # 大物体用DINO
 
-    def _calculate_motion_parameters(self, parsed_info: Dict) -> Dict[str, Any]:
-        """计算运动参数"""
-        motion_char = parsed_info.get("motion_characteristics", {})
-        action = parsed_info.get("action", "")
+        # 基于部位精度要求
+        if any(part in ["手", "眼", "鼻"] for part in target_parts):
+            return "lang_sam"  # 精细部位用Lang-SAM
 
-        # 从知识库获取基础参数
-        base_params = self.knowledge_base["motion_types"].get(action, {
-            "motion": "rotation",
-            "axis": [0, 1, 0]
-        })
-
-        return {
-            "rotation_axis": base_params.get("axis", [0, 1, 0]),
-            "rotation_angle": self._map_amplitude_to_angle(motion_char.get("amplitude", "medium")),
-            "translation": [0, 0, 0],  # 大多数情况下不需要平移
-            "motion_type": base_params.get("motion", "rotation"),
-            "easing_function": "ease_in_out"
-        }
-
-    def _map_amplitude_to_angle(self, amplitude: str) -> float:
-        """将幅度描述映射为角度"""
-        amplitude_map = {
-            "small": 15.0,
-            "medium": 30.0,
-            "large": 60.0,
-            "extreme": 90.0
-        }
-        return amplitude_map.get(amplitude, 30.0)
-
-    def _calculate_frame_count(self, parsed_info: Dict) -> int:
-        """计算动画帧数"""
-        frequency = parsed_info.get("motion_characteristics", {}).get("frequency", "low")
-        frequency_map = {
-            "low": 20,
-            "medium": 30,
-            "high": 60
-        }
-        return frequency_map.get(frequency, 30)
-
-    def _create_execution_strategy(self, parsed_info: Dict, thought_chain: List[ThoughtChain]) -> Dict[str, Any]:
-        """制定执行策略"""
-        return {
-            "execution_mode": "sequential",  # 串行执行
-            "retry_policy": {
-                "max_retries": 2,
-                "retry_conditions": ["low_confidence", "evaluation_failed"]
-            },
-            "optimization_strategy": {
-                "enable_iterative_improvement": True,
-                "max_iterations": 3,
-                "improvement_threshold": 0.8
-            },
-            "checkpoints": {
-                "save_intermediate_results": True,
-                "checkpoint_tasks": ["task_segmentation", "task_mapping"]
-            }
-        }
-
-    def _assess_risks(self, parsed_info: Dict, thought_chain: List[ThoughtChain]) -> Dict[str, Any]:
-        """评估执行风险"""
-        risks = {
-            "segmentation_risks": {
-                "small_parts_detection": 0.3 if any(
-                    "手" in part or "爪" in part for part in parsed_info.get("target_parts", [])) else 0.1,
-                "occlusion_handling": 0.2,
-                "boundary_accuracy": 0.15
-            },
-            "mapping_risks": {
-                "resolution_mismatch": 0.25,
-                "correspondence_errors": 0.3,
-                "depth_ambiguity": 0.2
-            },
-            "motion_risks": {
-                "unnatural_movement": 0.2,
-                "part_collision": 0.15,
-                "motion_continuity": 0.1
-            },
-            "overall_confidence": sum(tc.confidence for tc in thought_chain) / len(
-                thought_chain) if thought_chain else 0.5
-        }
-
-        return risks
-
-    async def plan_tasks(self, user_instruction: str) -> List[Task]:
-        """主要的任务规划接口（保持兼容性）"""
-        task_plan = await self.plan_tasks_with_reasoning(user_instruction)
-        return task_plan.tasks
-
-    async def execute_tasks_with_monitoring(self, task_plan: TaskPlan) -> Dict[str, Any]:
-        """带监控的任务执行"""
-        tasks = task_plan.tasks
-        execution_strategy = task_plan.execution_strategy
-        risk_assessment = task_plan.risk_assessment
-
-        results = {}
-        execution_context = {
-            "current_step": 0,
-            "total_steps": len(tasks),
-            "intermediate_results": {},
-            "performance_metrics": {}
-        }
-
-        logger.info("=" * 60)
-        logger.info("开始智能任务执行流程")
-        logger.info(f"总任务数: {len(tasks)}")
-        logger.info(f"整体风险评估置信度: {risk_assessment.get('overall_confidence', 0):.2f}")
-        logger.info("=" * 60)
-
-        for i, task in enumerate(tasks):
-            execution_context["current_step"] = i + 1
-
-            logger.info(f"\n[步骤 {i + 1}/{len(tasks)}] 执行任务: {task.task_id}")
-            logger.info(f"任务描述: {task.description}")
-
-            # 执行前的智能检查
-            pre_check_result = await self._pre_execution_check(task, execution_context, risk_assessment)
-            if not pre_check_result["proceed"]:
-                logger.warning(f"任务 {task.task_id} 预检查未通过: {pre_check_result['reason']}")
-                task.status = TaskStatus.FAILED
-                task.error_msg = pre_check_result["reason"]
-                continue
-
-            # 执行任务
-            task.status = TaskStatus.RUNNING
-            worker = self.workers.get(task.worker_type)
-
-            if not worker:
-                task.status = TaskStatus.FAILED
-                task.error_msg = f"未找到对应的Worker: {task.worker_type}"
-                results[task.task_id] = {"status": "failed", "error": task.error_msg}
-                continue
-
-            try:
-                # 智能数据传递 - 根据任务类型选择相关数据
-                enhanced_input = await self._prepare_enhanced_input(task, execution_context)
-                task.input_data.update(enhanced_input)
-
-                # 执行任务
-                start_time = asyncio.get_event_loop().time()
-                result = await worker.execute(task)
-                execution_time = asyncio.get_event_loop().time() - start_time
-
-                # 记录性能指标
-                execution_context["performance_metrics"][task.task_id] = {
-                    "execution_time": execution_time,
-                    "success": result.success,
-                    "confidence": getattr(result, 'confidence', 0.0)
-                }
-
-                if result.success:
-                    task.status = TaskStatus.COMPLETED
-                    task.output_data = result.data
-
-                    # 执行后的智能验证
-                    validation_result = await self._post_execution_validation(task, result, risk_assessment)
-
-                    if validation_result["valid"]:
-                        results[task.task_id] = {"status": "success", "data": result.data}
-                        execution_context["intermediate_results"][task.task_id] = result.data
-                        logger.info(f"✓ 任务 {task.task_id} 执行成功，耗时 {execution_time:.2f}s")
-                    else:
-                        logger.warning(f"⚠ 任务 {task.task_id} 结果验证失败: {validation_result['reason']}")
-                        # 根据策略决定是否重试
-                        if self._should_retry(task, execution_strategy):
-                            logger.info(f"准备重试任务 {task.task_id}")
-                            # 重试逻辑 (简化版，可扩展)
-                            retry_result = await worker.execute(task)
-                            if retry_result.success:
-                                task.status = TaskStatus.COMPLETED
-                                results[task.task_id] = {"status": "success", "data": retry_result.data}
-                            else:
-                                task.status = TaskStatus.FAILED
-                                results[task.task_id] = {"status": "failed", "error": retry_result.error}
-                        else:
-                            task.status = TaskStatus.FAILED
-                            results[task.task_id] = {"status": "failed", "error": validation_result["reason"]}
-                else:
-                    task.status = TaskStatus.FAILED
-                    task.error_msg = result.error
-                    results[task.task_id] = {"status": "failed", "error": result.error}
-                    logger.error(f"✗ 任务 {task.task_id} 执行失败: {result.error}")
-
-            except Exception as e:
-                task.status = TaskStatus.FAILED
-                task.error_msg = str(e)
-                results[task.task_id] = {"status": "failed", "error": str(e)}
-                logger.error(f"✗ 任务 {task.task_id} 执行异常: {e}")
-
-        # 添加执行总结
-        results["execution_summary"] = {
-            "total_tasks": len(tasks),
-            "successful_tasks": sum(
-                1 for r in results.values() if isinstance(r, dict) and r.get("status") == "success"),
-            "performance_metrics": execution_context["performance_metrics"],
-            "thought_chain_summary": [
-                {"step": tc.step, "thought": tc.thought, "confidence": tc.confidence}
-                for tc in task_plan.thought_chain
-            ]
-        }
-
-        self.task_history.extend(tasks)
-        return results
-
-    async def _pre_execution_check(self, task: Task, context: Dict, risk_assessment: Dict) -> Dict[str, Any]:
-        if task.work_type != "image_segmentation" and context["current_step"] > 1:
-            prev_results = context.get("intermediate_results", {})
-            if not prev_results:
-                return {"proceed": False, "reason": "缺少任务"}
-        task_risks = risk_assessment.get(f"{task.work_type}_risks", {})
-        max_risk = max(task_risks.values()) if task_risks else 0
-        if max_risk > 0.5:
-            logger.warning(f"任务 {task.task_id} 风险等级较高: {max_risk:.2f}")
-        return {"proceed": True, "reason": "预检查通过"}
-
-    async def _prepare_enhanced_input(self, task: Task, context: Dict) -> Dict[str, Any]:
-        """准备增强的输入数据"""
-        enhanced_input = {}
-
-        # 从上下文中获取相关的中间结果
-        intermediate_results = context.get("intermediate_results", {})
-
-        # if task.worker_type == "pointcloud_mapping":
-        #     # 点云映射任务需要分割结果
-        #     seg_result = intermediate_results.get("task_segmentation", {
-        #
-        #     async
-        #
-        #     def evaluate_and_improve(self, results: Dict[str, Any]) -> bool:
-        #
-        #         """评估结果并决定是否需要改进"""
-        #     # 获取可视化worker的评估结果
-        #     viz_result = results.get("task4", {})
-        #     if viz_result.get("status") == "success":
-        #         evaluation_score = viz_result.get("data", {}).get("evaluation_score", 0)
-        #         feedback = viz_result.get("data", {}).get("feedback", "")
-        #
-        #         logger.info(f"评估分数: {evaluation_score}, 反馈: {feedback}")
-        #
-        #         # 如果评估分数低于阈值，需要改进
-        #         if evaluation_score < 0.8:
-        #             logger.info("评估分数较低，需要重新调整映射网络")
-        #             return True
-        #
-        #     return False
+        return "dino"  # 默认使用DINO
 
     def _get_default_tasks(self, instruction: str) -> List[Task]:
         return [
@@ -542,15 +388,16 @@ class Planner:
             Task("task3", "rigid_motion", "刚性运动任务", {"instruction": instruction}),
             Task("task4", "visualization", "可视化任务", {"instruction": instruction})
         ]
-
+    async def execute_task_plan(self,task_plan:TaskPlan)->Optional:
+        return 'success'
     async def evaluate_and_improve(self, results: Dict[str, Any]) -> bool:
-        viz_result = results.get("task4", {})
-        if viz_result.get("status") == "success":
-            evaluation_score = viz_result.get("data", {}).get("evaluation_score", 0)
-            feedback = viz_result.get("data", {}).get("feedback", "")
-            logger.info(f"评估分数: {evaluation_score}, 反馈: {feedback}")
-
-            if evaluation_score < 0.8:
-                logger.info("评估分数较低")
-                return True
-        return False
+        # viz_result = results.get("task4", {})
+        # if viz_result.get("status") == "success":
+        #     evaluation_score = viz_result.get("data", {}).get("evaluation_score", 0)
+        #     feedback = viz_result.get("data", {}).get("feedback", "")
+        #     logger.info(f"评估分数: {evaluation_score}, 反馈: {feedback}")
+        #
+        #     if evaluation_score < 0.8:
+        #         logger.info("评估分数较低")
+        #         return True
+        return True
